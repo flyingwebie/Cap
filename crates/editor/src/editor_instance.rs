@@ -67,10 +67,7 @@ pub(super) fn cursor_timeline_settings(cursor: &cap_project::CursorConfiguration
     ]
 }
 
-/// Lower bound for [`EditorInstance::set_playback_rate`]. Preview-only, like a
-/// video player's speed control -- never affects project config or exports.
 pub const MIN_PLAYBACK_RATE: f64 = 0.25;
-/// Upper bound for [`EditorInstance::set_playback_rate`].
 pub const MAX_PLAYBACK_RATE: f64 = 4.0;
 
 #[derive(Default)]
@@ -530,7 +527,7 @@ impl EditorInstance {
         let completed_track_identity = completed_audio
             .as_deref()
             .map(crate::preparing_handoff::completed_track_identity);
-        let segments_task = tokio::spawn({
+        let segments_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn({
             let recording_meta = recording_meta.clone();
             let studio_meta = (**meta).clone();
             async move {
@@ -543,7 +540,7 @@ impl EditorInstance {
                 )
                 .await
             }
-        });
+        }));
 
         // Open the session's audio output stream now (in the background) so
         // the first play press doesn't wait on the device — Bluetooth outputs
@@ -809,12 +806,6 @@ impl EditorInstance {
         &self.meta
     }
 
-    /// Sets the preview-only playback speed (1.0 = normal). Non-finite values
-    /// are ignored; finite values are clamped to
-    /// [`MIN_PLAYBACK_RATE`]..=[`MAX_PLAYBACK_RATE`]. Applies live to a
-    /// running playback without a stop/restart, and persists across
-    /// play/stop. Never touches project config, exports, or the timeline
-    /// coordinate system.
     pub fn set_playback_rate(&self, rate: f64) {
         if !rate.is_finite() {
             warn!(rate, "Ignoring non-finite playback rate");
@@ -824,7 +815,6 @@ impl EditorInstance {
         let _ = self.playback_rate.send(clamped);
     }
 
-    /// Current preview playback speed (1.0 = normal).
     pub fn playback_rate(&self) -> f64 {
         *self.playback_rate_rx.borrow()
     }
@@ -1114,6 +1104,17 @@ impl EditorInstance {
                         zoom_timelines.clear();
                         outgoing_zoom_timelines.clear();
                     }
+                    let total_duration = project
+                        .timeline
+                        .as_ref()
+                        .map(|timeline| timeline.duration())
+                        .unwrap_or(0.0);
+                    let total_frames = (total_duration * f64::from(fps)).ceil() as u32;
+                    let mut last_frame = total_frames.saturating_sub(1);
+                    if f64::from(last_frame) / f64::from(fps) >= total_duration {
+                        last_frame = last_frame.saturating_sub(1);
+                    }
+                    let frame_number = frame_number.min(last_frame);
                     let frame_time = frame_number as f64 / fps as f64;
                     let transition_mapping = project.timeline.as_ref().and_then(|timeline| {
                         if timeline.transitions.is_empty() {
@@ -1178,12 +1179,6 @@ impl EditorInstance {
                                 warn!("Preview renderer: no frames returned for frame {}", frame_number);
                                 break;
                             }
-
-                            let total_duration = project
-                                .timeline
-                                .as_ref()
-                                .map(|t| t.duration())
-                                .unwrap_or(0.0);
 
                             // Scrub renders sample the same precomputed spring
                             // timeline playback and export use (the old focus

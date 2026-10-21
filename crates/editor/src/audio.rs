@@ -1305,6 +1305,7 @@ fn mix_music(
     let sample_rate = AudioData::SAMPLE_RATE as f64;
     let frame_start = frame_start as i64;
     let frame_end = frame_start + samples as i64;
+    let mut mixed = vec![false; samples];
 
     for segment in &timeline.audio_segments {
         if !segment.enabled || segment.end <= segment.start {
@@ -1375,9 +1376,23 @@ fn mix_music(
                 (*l, *r)
             };
 
-            let out_index = ((out_sample - frame_start) as usize) * 2;
-            out[out_index] = (out[out_index] + l * g).clamp(-1.0, 1.0);
-            out[out_index + 1] = (out[out_index + 1] + r * g).clamp(-1.0, 1.0);
+            let frame = (out_sample - frame_start) as usize;
+            out[frame * 2] += l * g;
+            out[frame * 2 + 1] += r * g;
+            mixed[frame] = true;
+        }
+    }
+
+    // Only frames that received music are clipped: recording audio can sit
+    // above 1.0 (clip volume goes to 2x) and must not change because music
+    // plays elsewhere on the timeline.
+    for (frame, _) in out[..samples * 2]
+        .chunks_exact_mut(2)
+        .zip(&mixed)
+        .filter(|(_, mixed)| **mixed)
+    {
+        for sample in frame {
+            *sample = sample.clamp(-1.0, 1.0);
         }
     }
 }
@@ -2498,11 +2513,7 @@ fn spawn_progressive_render(
     }
 }
 
-/// Analysis frame length for [`TimeStretcher`]'s WSOLA. ~20-30ms is the usual
-/// sweet spot for speech.
 const STRETCH_FRAME_MS: f64 = 25.0;
-/// How far from the nominal analysis position WSOLA searches for the
-/// best-correlated overlap, each direction.
 const STRETCH_TOLERANCE_MS: f64 = 6.0;
 
 fn hann_periodic_window(len: usize) -> Vec<f32> {
@@ -2515,31 +2526,10 @@ fn hann_periodic_window(len: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Realtime-safe, pitch-preserving time stretcher for the preview playback
-/// rate (see [`crate::EditorInstance::set_playback_rate`]).
-///
-/// Implements WSOLA (Waveform Similarity Overlap-Add): consecutive
-/// `frame_len`-sample analysis frames are windowed (periodic Hann, 50%
-/// overlap) and overlap-added into `synthesis_hop`-sample output chunks,
-/// advancing the nominal input position by `synthesis_hop * rate` each hop.
-/// Before extracting a frame, a small search (`+/- tolerance`, scored by
-/// unnormalized cross-correlation against the previous frame's tail) picks
-/// the best-aligned offset, avoiding the phase cancellation a naive
-/// fixed-offset overlap-add would produce. Pitch is unaffected because every
-/// frame is played back at the source's native sample rate; only how often
-/// frames overlap changes.
-///
-/// At `rate == 1.0`, as long as the stretcher has never been engaged, `fill`
-/// is a direct passthrough to the caller's `pull` closure -- bit-identical to
-/// unstretched playback, with none of the buffering below allocated into the
-/// hot path. Once engaged by a non-1.0 rate, the WSOLA path keeps running
-/// (COLA-correct, so audio stays continuous) even if the rate later returns
-/// to exactly 1.0, trading a few hundred microseconds of CPU for avoiding a
-/// resync glitch; this is a deliberate simplification and a known deviation
-/// from "always bit-identical at 1.0" once the rate has ever been touched.
-///
-/// All buffers are preallocated in [`TimeStretcher::new`] for the worst case
-/// (max rate, max search tolerance); `fill` never allocates.
+/// WSOLA time stretcher for the preview playback rate. It runs inside the
+/// realtime audio callback, so every buffer is sized in `new` for the
+/// worst-case rate and `fill` never allocates. At exactly 1x it is a
+/// passthrough, so normal-speed playback stays bit-identical.
 pub(crate) struct TimeStretcher<T: FromSampleBytes> {
     channels: usize,
     sample_rate: u32,
@@ -2553,6 +2543,7 @@ pub(crate) struct TimeStretcher<T: FromSampleBytes> {
     overlap_tail: Vec<f32>,
     corr_ref: Vec<f32>,
     has_overlap: bool,
+    last_frame_start: i64,
     active: bool,
     pending_output: Vec<f32>,
     pending_start: usize,
@@ -2599,6 +2590,7 @@ where
             overlap_tail: vec![0.0; synthesis_hop * channels],
             corr_ref: vec![0.0; synthesis_hop],
             has_overlap: false,
+            last_frame_start: 0,
             active: false,
             pending_output: vec![0.0; synthesis_hop * channels],
             pending_start: 0,
@@ -2609,9 +2601,6 @@ where
         }
     }
 
-    /// Discards buffered lookahead and overlap-add state. Call on seek /
-    /// reseat so the next `fill` starts clean from wherever the source's
-    /// playhead was just moved to.
     pub(crate) fn flush(&mut self) {
         self.ring.clear();
         self.ring_base_frame = 0;
@@ -2619,13 +2608,27 @@ where
         self.overlap_tail.fill(0.0);
         self.corr_ref.fill(0.0);
         self.has_overlap = false;
+        self.last_frame_start = 0;
         self.pending_start = 0;
         self.pending_end = 0;
+        self.active = false;
     }
 
-    /// Source-timeline seconds of audio this stretcher has already pulled
-    /// from the source but not yet handed to the output -- lookahead the
-    /// search needs plus one hop of already-produced-but-undelivered output.
+    /// Leaves the WSOLA path once the rate is back to 1x. The source has been
+    /// read ahead of what was heard, so this returns where the source must be
+    /// moved back to for passthrough to continue from the last emitted sample.
+    pub(crate) fn resume_passthrough(&mut self, source_playhead_secs: f64) -> Option<f64> {
+        if !self.active {
+            return None;
+        }
+        let pending_frames = ((self.pending_end - self.pending_start) / self.channels) as i64;
+        let emitted_until = self.last_frame_start + self.synthesis_hop as i64 - pending_frames;
+        let pulled_until = self.ring_base_frame as i64 + (self.ring.len() / self.channels) as i64;
+        let read_ahead = (pulled_until - emitted_until).max(0) as f64;
+        self.flush();
+        Some((source_playhead_secs - read_ahead / f64::from(self.sample_rate)).max(0.0))
+    }
+
     fn internal_delay_secs(&self) -> f64 {
         if !self.active {
             return 0.0;
@@ -2635,17 +2638,12 @@ where
         buffered_frames as f64 / f64::from(self.sample_rate)
     }
 
-    /// Maps the underlying buffer's raw (pulled-sample) position to what is
-    /// actually audible right now, correcting for this stretcher's own
-    /// internal lookahead delay.
     pub(crate) fn current_audible_playhead(&self, raw_playhead_secs: f64) -> f64 {
         (raw_playhead_secs - self.internal_delay_secs()).max(0.0)
     }
 
-    /// Fills `output` at `rate`x the source's pace, preserving pitch. `pull`
-    /// must behave like [`PrerenderedAudioBuffer::fill`]: always fill the
-    /// whole slice requested, padding with silence past the end of the
-    /// source.
+    /// `pull` must fill the whole slice, padding with silence past the end of
+    /// the source, like [`PrerenderedAudioBuffer::fill`].
     pub(crate) fn fill(&mut self, output: &mut [T], rate: f64, mut pull: impl FnMut(&mut [T])) {
         if rate == 1.0 && !self.active {
             pull(output);
@@ -2715,6 +2713,7 @@ where
         let max_start = (ring_len_frames - frame_len).max(0);
         let candidate_start =
             (nominal + best_offset - ring_base_frame).clamp(0, max_start) as usize;
+        self.last_frame_start = ring_base_frame + candidate_start as i64;
         let frame_len = frame_len as usize;
 
         for i in 0..frame_len {
@@ -2823,6 +2822,40 @@ mod time_stretch_tests {
 
         assert_eq!(output, source[..2_048]);
         assert_eq!(puller.total_pulled, 2_048);
+    }
+
+    #[test]
+    fn returning_to_unit_rate_resumes_bit_identical_passthrough() {
+        let sample_rate = 48_000u32;
+        let rate = 1.5;
+        let mut stretcher = TimeStretcher::<f32>::new(sample_rate, 1);
+        let source = sine_source(sample_rate, 220.0, sample_rate as usize * 3);
+        let mut puller = VecPuller {
+            data: &source,
+            pos: 0,
+            total_pulled: 0,
+        };
+
+        let mut output = vec![0.0f32; 4_800];
+        stretcher.fill(&mut output, rate, |buf| puller.pull_into(buf));
+
+        let resume = stretcher
+            .resume_passthrough(puller.pos as f64 / f64::from(sample_rate))
+            .expect("stretcher was engaged");
+        let resume_frame = (resume * f64::from(sample_rate)).round() as usize;
+        assert!(resume_frame <= puller.pos);
+        let heard = (output.len() as f64 * rate) as usize;
+        assert!(
+            resume_frame.abs_diff(heard) <= 2_400,
+            "resume={resume_frame}, heard={heard}"
+        );
+
+        puller.pos = resume_frame;
+        let pulled_before = puller.total_pulled;
+        stretcher.fill(&mut output, 1.0, |buf| puller.pull_into(buf));
+        assert_eq!(output, source[resume_frame..resume_frame + output.len()]);
+        assert_eq!(puller.total_pulled - pulled_before, output.len());
+        assert!(stretcher.resume_passthrough(0.0).is_none());
     }
 
     #[test]
@@ -4066,6 +4099,69 @@ mod tests {
                 ..Default::default()
             }],
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn music_mixing_leaves_recording_only_frames_unclipped() {
+        let music: MusicTracks = [(
+            "a.wav".to_string(),
+            Arc::new(AudioData::from_raw_f32(vec![0.25, 0.25, 0.25, 0.25], 2)),
+        )]
+        .into_iter()
+        .collect();
+        let project = music_project(vec![music_track_segment("a.wav", 0.0, 3.0, 0.0, 0.0)]);
+        let mut out = [1.5, -1.5].repeat(4);
+        mix_music(&music, project.timeline.as_ref().unwrap(), 0, 4, &mut out);
+        assert_eq!(out, [1.0, -1.0, 1.0, -1.0, 1.5, -1.5, 1.5, -1.5]);
+    }
+
+    #[test]
+    fn overlapping_music_clips_only_after_all_tracks_are_mixed() {
+        let music: MusicTracks = [
+            ("a.wav", vec![0.75, -0.75, 0.75, -0.75]),
+            ("b.wav", vec![0.75, -0.75, 0.75, -0.75]),
+            ("c.wav", vec![-0.75, 0.75, 0.75, -0.75]),
+        ]
+        .into_iter()
+        .map(|(path, samples)| {
+            (
+                path.to_string(),
+                Arc::new(AudioData::from_raw_f32(samples, 2)),
+            )
+        })
+        .collect();
+        for paths in [
+            ["a.wav", "b.wav", "c.wav"],
+            ["a.wav", "c.wav", "b.wav"],
+            ["c.wav", "a.wav", "b.wav"],
+        ] {
+            let project = music_project(
+                paths
+                    .map(|path| music_track_segment(path, 0.0, 3.0, 0.0, 0.0))
+                    .to_vec(),
+            );
+            for block in [1, 2] {
+                let recording = AudioSegment {
+                    tracks: vec![AudioSegmentTrack::new(
+                        Arc::new(AudioData::from_raw_f32(
+                            vec![0.125, -0.125, 0.125, -0.125],
+                            2,
+                        )),
+                        gain,
+                        stereo,
+                        no_offset,
+                    )],
+                };
+                let mut renderer = AudioRenderer::new(vec![recording]).with_music(music.clone());
+                let mut output = Vec::new();
+                for _ in 0..2 / block {
+                    let (written, chunk) = renderer.render_frame_raw(block, &project).unwrap();
+                    assert_eq!(written, block);
+                    output.extend(chunk);
+                }
+                assert_eq!(output, [0.875, -0.875, 1.0, -1.0], "{paths:?}, {block}");
+            }
         }
     }
 
