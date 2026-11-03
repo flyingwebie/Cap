@@ -7,15 +7,16 @@ use cap_project::{
     TimelineFrameMapping, TimelineSegment, XY,
 };
 use cap_rendering::{
-    PrecomputedCursorTimeline, ProjectRecordingsMeta, ProjectUniforms, RecordingSegmentDecoders,
-    RenderVideoConstants, RendererLayers, SegmentVideoPaths, SharedWgpuDevice, Video,
-    ZoomTransformTimeline, get_duration, spring_mass_damper::SpringMassDamperSimulationConfig,
+    CursorEventOrder, PrecomputedCursorTimeline, ProjectRecordingsMeta, ProjectUniforms,
+    RecordingSegmentDecoders, RenderVideoConstants, RendererLayers, SegmentVideoPaths,
+    SharedWgpuDevice, Video, ZoomTransformTimeline, get_duration,
+    spring_mass_damper::SpringMassDamperSimulationConfig,
 };
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -73,6 +74,12 @@ pub const MAX_PLAYBACK_RATE: f64 = 4.0;
 #[derive(Default)]
 pub(super) struct PreviewCursorCache {
     entries: Vec<PreviewCursorCacheEntry>,
+    event_orders: Vec<PreviewCursorOrderEntry>,
+}
+
+struct PreviewCursorOrderEntry {
+    cursor: Weak<CursorEvents>,
+    order: CursorEventOrder,
 }
 
 struct PreviewCursorCacheEntry {
@@ -83,6 +90,29 @@ struct PreviewCursorCacheEntry {
 }
 
 impl PreviewCursorCache {
+    pub(super) fn event_order(&mut self, cursor: &Arc<CursorEvents>) -> CursorEventOrder {
+        if let Some(index) = self
+            .event_orders
+            .iter()
+            .position(|entry| std::ptr::eq(entry.cursor.as_ptr(), Arc::as_ptr(cursor)))
+        {
+            let entry = self.event_orders.remove(index);
+            let order = entry.order;
+            self.event_orders.push(entry);
+            return order;
+        }
+
+        if self.event_orders.len() == PREVIEW_CURSOR_CACHE_CAPACITY {
+            self.event_orders.remove(0);
+        }
+        let order = CursorEventOrder::new(cursor);
+        self.event_orders.push(PreviewCursorOrderEntry {
+            cursor: Arc::downgrade(cursor),
+            order,
+        });
+        order
+    }
+
     pub(super) fn get(
         &mut self,
         recording_clip: u32,
@@ -893,6 +923,13 @@ impl EditorInstance {
     /// config off the async runtime so playback start isn't blocked by ffmpeg.
     async fn load_music_tracks(&self) -> crate::MusicTracks {
         let project = self.project_config.1.borrow().clone();
+        self.load_music_tracks_for(project).await
+    }
+
+    /// [`Self::load_music_tracks`] for an explicit config. The timeline's
+    /// imported-audio waveforms read their samples through this so they share
+    /// playback's decode cache instead of decoding the files a second time.
+    pub async fn load_music_tracks_for(&self, project: ProjectConfiguration) -> crate::MusicTracks {
         let project_path = self.project_path.clone();
         let cache = self.music_cache.clone();
 
@@ -1281,7 +1318,7 @@ impl EditorInstance {
                                             cursor_timeline,
                                         )
                                     } else {
-                                        ProjectUniforms::new(
+                                        ProjectUniforms::new_with_cursor_event_order(
                                             &self.render_constants,
                                             &project,
                                             frame_number,
@@ -1291,6 +1328,7 @@ impl EditorInstance {
                                             &outgoing_frames,
                                             total_duration,
                                             outgoing_zoom,
+                                            cursor_cache.event_order(&outgoing_media.cursor),
                                         )
                                     };
                                     Some((
@@ -1342,7 +1380,7 @@ impl EditorInstance {
                                         cursor_timeline,
                                     )
                                 } else {
-                                    ProjectUniforms::new(
+                                    ProjectUniforms::new_with_cursor_event_order(
                                         &self.render_constants,
                                         &project,
                                         frame_number,
@@ -1352,6 +1390,7 @@ impl EditorInstance {
                                         &segment_frames,
                                         total_duration,
                                         zoom_timeline,
+                                        cursor_cache.event_order(&segment_medias.cursor),
                                     )
                                 };
 
@@ -2202,6 +2241,20 @@ mod tests {
         assert!(cache.entries.is_empty());
         assert!(smoothed_weak.upgrade().is_none());
         assert_eq!(Arc::strong_count(&cursor), 1);
+        let order = cache.event_order(&cursor);
+        assert_eq!(order, CursorEventOrder::new(&cursor));
+        assert_ne!(order, CursorEventOrder::default());
+        assert_eq!(cache.event_order(&cursor), order);
+        assert_eq!(cache.event_orders.len(), 1);
+        assert_eq!(Arc::strong_count(&cursor), 1);
+
+        let mut reversed = CursorEvents::clone(&cursor);
+        reversed.moves.reverse();
+        reversed.clicks.reverse();
+        let replaced = Arc::new(reversed);
+        assert_eq!(cache.event_order(&replaced), CursorEventOrder::default());
+        assert_eq!(cache.event_orders.len(), 2);
+        assert_eq!(Arc::strong_count(&replaced), 1);
 
         project.cursor.tension += 1.0;
         project.cursor.click_spring = Some(cap_project::ClickSpringConfig {
